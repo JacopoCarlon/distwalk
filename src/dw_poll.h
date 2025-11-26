@@ -5,13 +5,14 @@
 #include <sys/epoll.h>
 #include <poll.h>
 
-typedef enum { DW_SELECT, DW_POLL, DW_EPOLL } dw_poll_type_t;
+typedef enum { DW_SELECT, DW_POLL, DW_EPOLL, DW_IO_URING } dw_poll_type_t;  // io_uring TODO changed
 
 // these flags are OR-ed both in input and output to dw_poll_*()
 typedef enum { DW_POLLIN=0x001, DW_POLLOUT=0x004, DW_POLLONESHOT=1u << 30, DW_POLLERR=0x008, DW_POLLHUP=0x010 } dw_poll_flags;
 
 #define MAX_POLLFD 8192
 #define MAX_POLL_EVENTS 16
+#define IO_URING_ENTRIES 4096       // io_uring TODO changed 
 
 typedef struct {
     dw_poll_type_t poll_type;
@@ -41,6 +42,19 @@ typedef struct {
             int n_events;
             int iter;
         } epoll_fds;
+        #ifdef USE_IO_URING 
+            // io_uring TODO changed
+            struct {
+                struct io_uring ring;
+                struct io_uring_cqe *cqes[MAX_POLL_EVENTS];
+                uint64_t aux_map[IO_URING_ENTRIES];  // Map sqe->user_data to aux
+                int fd_map[IO_URING_ENTRIES];        // Map sqe->user_data to fd
+                dw_poll_flags flags_map[IO_URING_ENTRIES]; // Map sqe->user_data to flags
+                int n_outstanding;
+                int cqe_iter;
+                int cqe_count;
+            } io_uring_fds;
+        #endif
     } u;
 } dw_poll_t;
 

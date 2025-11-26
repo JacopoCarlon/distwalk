@@ -184,6 +184,8 @@ accept_mode_t accept_mode = AM_CHILD;
 dw_poll_type_t poll_mode = DW_EPOLL;
 int listen_backlog = 5;
 
+int use_io_uring = 0;   // io_uring TODO changed
+
 int terminationfd; // special signalfd to handle termination
 
 // -1: old frequency-invariant behavior
@@ -1350,8 +1352,10 @@ enum argp_node_option_keys {
     SSL_CA_FILE,
     SSL_CIPHERS,
     SSL_CA_PATH,
-    SSL_VERIFY
+    SSL_VERIFY,
+    USE_IO_URING    
 };
+// io_uring TODO changed
 
 struct argp_node_arguments {
     int periodic_sync_msec;
@@ -1367,7 +1371,9 @@ struct argp_node_arguments {
     char* ssl_ciphers;
     char* ssl_ca_path;
     int ssl_verify;
+    int use_io_uring;   
 };
+// io_uring TODO changed
 
 static struct argp_option argp_node_options[] = {
     // long name, short name, value name, flag, description
@@ -1398,8 +1404,10 @@ static struct argp_option argp_node_options[] = {
     {"ssl-ciphers",       SSL_CIPHERS,       "CIPHERS",                       0,  "Allowed SSL ciphers" },
     {"ssl-ca-path",       SSL_CA_PATH,       "DIR",                           0,  "Server SSL CA path" },
     {"ssl-verify",        SSL_VERIFY,        0,                               0,  "Enable peer certificate verification"},
+    {"io_uring",          USE_IO_URING,      0,                               0,  "Enable io_uring polling backend"},
     { 0 }
 };
+// io_uring TODO changed
 
 static error_t argp_node_parse_opt(int key, char *arg, struct argp_state *state) {
     /* Get the input argument from argp_parse, which we
@@ -1440,6 +1448,11 @@ static error_t argp_node_parse_opt(int key, char *arg, struct argp_state *state)
             poll_mode = DW_POLL;
         else if (strcmp(arg, "select") == 0)
             poll_mode = DW_SELECT;
+        else if (strcmp(arg, "io_uring") == 0) {
+            // io_uring TODO changed
+            poll_mode = DW_IO_URING;
+            use_io_uring = 1;
+        }
         else {
             printf("Invalid poll mode parameter: %s\n", arg);
             exit(EXIT_FAILURE);
@@ -1447,6 +1460,11 @@ static error_t argp_node_parse_opt(int key, char *arg, struct argp_state *state)
         break;
     case BACKLOG_LENGTH:
         listen_backlog = atoi(arg);
+        break;
+    case USE_IO_URING:
+        // io_uring TODO changed
+        use_io_uring = 1;
+        poll_mode = DW_IO_URING;
         break;
     case NO_DELAY:
         no_delay = atoi(arg);
@@ -1604,6 +1622,18 @@ int main(int argc, char *argv[]) {
     input_args.ssl_ca_path = NULL;
     input_args.ssl_verify = 0;
 
+    #ifdef USE_IO_URING
+        // io_uring TODO changed
+        // Check if io_uring is available at runtime
+        struct io_ring ring;
+        if (io_uring_queue_init(8, &ring, 0) < 0) {
+            fprintf(stderr, "Warning: io_uring not available, falling back to epoll\n");
+            poll_mode = DW_EPOLL;
+        }
+        io_uring_queue_exit(&ring);
+    #endif
+
+
     char *home_path = getenv("HOME");
     check(home_path != NULL && strlen(home_path) + 10 < sizeof(storage_worker_info.storage_info));
     strcpy(storage_worker_info.storage_info.storage_path, home_path);
@@ -1612,6 +1642,14 @@ int main(int argc, char *argv[]) {
 
     argp_parse(&argp, argc, argv, ARGP_NO_HELP, 0, &input_args);
     
+    // Validate io_uring selection
+    // io_uring TODO changed
+    #ifndef USE_IO_URING
+        if (poll_mode == DW_IO_URING) {
+            argp_failure(state, 1, 0, "io_uring support not compiled in. Recompile with -DUSE_IO_URING");
+        }
+    #endif
+
     // Handle SIGINT and SIGTERM via epoll
     sigset_t term_sigmask;
     sigemptyset(&term_sigmask);
@@ -1793,6 +1831,11 @@ int main(int argc, char *argv[]) {
         }
     }
     dw_log("Using loops_per_usec: %g\n", loops_per_usec);
+
+    // Log polling mode
+    // io_uring TODO changed
+    const char* poll_mode_str[] = {"select", "poll", "epoll", "io_uring"};
+    dw_log("Using polling mode: %s\n", poll_mode_str[poll_mode]);
 
     // Initialize conn_worker_infos
     for (int i = 0; i < input_args.num_threads; i++) {

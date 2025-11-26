@@ -3,6 +3,11 @@
 #include "dw_poll.h"
 #include "dw_debug.h"
 
+// io_uring TODO changed
+#ifdef USE_IO_URING
+#include <liburing.h>
+#endif
+
 extern int use_wait_spinning;
 
 // return value useful to return failure if we allocate memory here in the future
@@ -19,6 +24,18 @@ int dw_poll_init(dw_poll_t *p_poll, dw_poll_type_t type) {
     case DW_EPOLL:
         sys_check(p_poll->u.epoll_fds.epollfd = epoll_create1(0));
         break;
+    #ifdef USE_IO_URING 
+    // io_uring TODO changed
+        case DW_IO_URING:
+            memset(&p_poll->u.io_uring_fds, 0, sizeof(p_poll->u.io_uring_fds));
+            int ret = io_uring_queue_init(IO_URING_ENTRIES, &p_poll->u.io_uring_fds.ring, 0);
+            if (ret < 0) {
+                errno = -ret;
+                return -1;
+            }
+            break;
+    #endif
+
     default:
         check(0, "Wrong dw_poll_type");
     }
@@ -111,6 +128,35 @@ int dw_poll_add(dw_poll_t *p_poll, int fd, dw_poll_flags flags, uint64_t aux) {
         if ((rv = epoll_ctl(p_poll->u.epoll_fds.epollfd, EPOLL_CTL_ADD, fd, &ev)) < 0)
             perror("epoll_ctl() failed: ");
         break; }
+
+    #ifdef USE_IO_URING
+        // io_uring TODO changed
+        case DW_IO_URING: {
+            struct io_uring *ring = &p_poll->u.io_uring_fds.ring;
+            struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+            if (!sqe) {
+                dw_log("No available SQEs in io_uring\n");
+                return -1;
+            }
+            
+            // Use the sqe index as our user_data to map back to aux
+            unsigned idx = sqe - ring->sq.sqes;
+            p_poll->u.io_uring_fds.aux_map[idx] = aux;
+            p_poll->u.io_uring_fds.fd_map[idx] = fd;
+            p_poll->u.io_uring_fds.flags_map[idx] = flags;
+            
+            unsigned poll_events = 0;
+            if (flags & DW_POLLIN) poll_events |= POLLIN;
+            if (flags & DW_POLLOUT) poll_events |= POLLOUT;
+            
+            io_uring_prep_poll_add(sqe, fd, poll_events);
+            sqe->user_data = idx;
+            
+            p_poll->u.io_uring_fds.n_outstanding++;
+            rv = 0;
+            break; }
+    #endif
+
     default:
         check(0, "Wrong dw_poll_type");
     }
@@ -168,6 +214,49 @@ int dw_poll_mod(dw_poll_t *p_poll, int fd, dw_poll_flags flags, uint64_t aux) {
         else
             rv = epoll_ctl(p_poll->u.epoll_fds.epollfd, EPOLL_CTL_DEL, fd, NULL);
         break; }
+        #ifdef USE_IO_URING
+            // io_uring TODO changed
+            case DW_IO_URING: {
+                // For io_uring, we need to find and remove existing entries for this fd
+                // This is a limitation of the current abstraction - io_uring doesn't have direct mod
+                struct io_uring *ring = &p_poll->u.io_uring_fds.ring;
+
+                // First, remove any existing entries for this fd
+                for (unsigned i = 0; i < IO_URING_ENTRIES; i++) {
+                    if (p_poll->u.io_uring_fds.fd_map[i] == fd) {
+                        // Mark as removed
+                        p_poll->u.io_uring_fds.fd_map[i] = -1;
+                        p_poll->u.io_uring_fds.n_outstanding--;
+                    }
+                }
+
+                // If new flags are non-zero, add a new entry
+                if (flags != 0) {
+                    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+                    if (!sqe) {
+                        dw_log("No available SQEs in io_uring for mod\n");
+                        return -1;
+                    }
+
+                    unsigned idx = sqe - ring->sq.sqes;
+                    p_poll->u.io_uring_fds.aux_map[idx] = aux;
+                    p_poll->u.io_uring_fds.fd_map[idx] = fd;
+                    p_poll->u.io_uring_fds.flags_map[idx] = flags;
+
+                    unsigned poll_events = (flags & DW_POLLIN ? POLLIN : 0) | (flags & DW_POLLOUT ? POLLOUT : 0);
+                    io_uring_prep_poll_add(sqe, fd, poll_events);
+                    sqe->user_data = idx;
+
+                    p_poll->u.io_uring_fds.n_outstanding++;
+                }
+
+                // Submit the changes
+                int submitted = io_uring_submit(ring);
+                if (submitted < 0)
+                    return -1;
+                break; }
+        #endif
+        
     default:
         check(0, "Wrong dw_poll_type");
     }
@@ -215,6 +304,27 @@ int dw_poll_wait(dw_poll_t *p_poll) {
         if (rv >= 0)
             p_poll->u.epoll_fds.n_events = rv;
         break;
+    #ifdef USE_IO_URING
+        // io_uring TODO changed
+        case DW_IO_URING: {
+            struct io_uring *ring = &p_poll->u.io_uring_fds.ring;
+            
+            // Submit all prepared SQEs
+            int submitted = io_uring_submit(ring);
+            if (submitted < 0) {
+                rv = -1;
+                break;
+            }
+            
+            // Wait for completions - get multiple CQEs in batch
+            rv = io_uring_peek_batch_cqe(ring, p_poll->u.io_uring_fds.cqes, MAX_POLL_EVENTS);
+            if (rv >= 0) {
+                p_poll->u.io_uring_fds.cqe_count = rv;
+                p_poll->u.io_uring_fds.cqe_iter = 0;
+            }
+            break; }
+    #endif
+
     default:
         check(0, "Wrong dw_poll_type");
     }
@@ -282,6 +392,35 @@ int dw_poll_next(dw_poll_t *p_poll, dw_poll_flags *flags, uint64_t *aux) {
             return 1;
         }
         break;
+    #ifdef USE_IO_URING
+        // io_uring TODO changed
+        case DW_IO_URING: {
+            if (p_poll->u.io_uring_fds.cqe_iter < p_poll->u.io_uring_fds.cqe_count) {
+                struct io_uring *ring = &p_poll->u.io_uring_fds.ring;
+                struct io_uring_cqe *cqe = p_poll->u.io_uring_fds.cqes[p_poll->u.io_uring_fds.cqe_iter];
+                unsigned idx = cqe->user_data;
+
+                // Skip if this entry was removed/modified
+                if (p_poll->u.io_uring_fds.fd_map[idx] == -1) {
+                    io_uring_cqe_seen(ring, cqe);
+                    p_poll->u.io_uring_fds.cqe_iter++;
+                    continue;
+                }
+
+                *aux = p_poll->u.io_uring_fds.aux_map[idx];
+                *flags = 0;
+                *flags |= (cqe->res & POLLIN) ? DW_POLLIN : 0;
+                *flags |= (cqe->res & POLLOUT) ? DW_POLLOUT : 0;
+                *flags |= (cqe->res < 0) ? DW_POLLERR : 0;
+
+                io_uring_cqe_seen(ring, cqe);
+                p_poll->u.io_uring_fds.n_outstanding--;
+                p_poll->u.io_uring_fds.cqe_iter++;
+                return 1;
+            }
+            break; }
+    #endif
+
     default:
         check(0, "Wrong dw_poll_type");
     }
