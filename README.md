@@ -139,3 +139,15 @@ a new connection for the subsequent session)
 ```bash
   ./dw_client --nt 3 --ns 10 -n 5000 -r 250 -C 1000
 ```
+
+
+
+
+## Requirements : 
+
+##### io_uring : 
+```shell
+sudo apt-get install liburing-dev
+```
+
+

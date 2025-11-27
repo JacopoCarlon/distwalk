@@ -395,7 +395,8 @@ int dw_poll_next(dw_poll_t *p_poll, dw_poll_flags *flags, uint64_t *aux) {
     #ifdef USE_IO_URING
         // io_uring TODO changed
         case DW_IO_URING: {
-            if (p_poll->u.io_uring_fds.cqe_iter < p_poll->u.io_uring_fds.cqe_count) {
+            //if (p_poll->u.io_uring_fds.cqe_iter < p_poll->u.io_uring_fds.cqe_count) {
+            while (p_poll->u.io_uring_fds.cqe_iter < p_poll->u.io_uring_fds.cqe_count) {
                 struct io_uring *ring = &p_poll->u.io_uring_fds.ring;
                 struct io_uring_cqe *cqe = p_poll->u.io_uring_fds.cqes[p_poll->u.io_uring_fds.cqe_iter];
                 unsigned idx = cqe->user_data;

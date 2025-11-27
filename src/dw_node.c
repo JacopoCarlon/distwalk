@@ -1353,7 +1353,7 @@ enum argp_node_option_keys {
     SSL_CIPHERS,
     SSL_CA_PATH,
     SSL_VERIFY,
-    USE_IO_URING
+    USE_IO_URING_OPT
 };
 // io_uring TODO changed
 // todo : update USE_IO_URING to USE_IO_URING_OPT since USE_IO_URING is already a macro from compiler flag !
@@ -1405,7 +1405,7 @@ static struct argp_option argp_node_options[] = {
     {"ssl-ciphers",       SSL_CIPHERS,       "CIPHERS",                       0,  "Allowed SSL ciphers" },
     {"ssl-ca-path",       SSL_CA_PATH,       "DIR",                           0,  "Server SSL CA path" },
     {"ssl-verify",        SSL_VERIFY,        0,                               0,  "Enable peer certificate verification"},
-    {"io_uring",          USE_IO_URING,      0,                               0,  "Enable io_uring polling backend"},
+    {"io_uring",          USE_IO_URING_OPT,  0,                               0,  "Enable io_uring polling backend"},
     { 0 }
 };
 // io_uring TODO changed
@@ -1462,7 +1462,7 @@ static error_t argp_node_parse_opt(int key, char *arg, struct argp_state *state)
     case BACKLOG_LENGTH:
         listen_backlog = atoi(arg);
         break;
-    case USE_IO_URING:
+    case USE_IO_URING_OPT:
         // io_uring TODO changed
         use_io_uring = 1;
         poll_mode = DW_IO_URING;
