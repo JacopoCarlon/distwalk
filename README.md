@@ -35,6 +35,27 @@ Cluster, Cloud and Internet Computing (IEEE CCGRID 2025), May 19-22,
 2025, Tromsø, Norway.
 See also: https://retis.santannapisa.it/~tommaso/papers/ccgrid25.php
 
+
+
+
+
+REQUIRED PACKETS 
+----------------------------------------------------------------------
+##### SSL :
+```shell
+sudo apt-get install libssl-dev
+```
+
+
+##### io_uring : 
+(functionality added by Jacopo Carlon and Jacopo Del Granchio)
+```shell
+sudo apt-get install liburing-dev
+```
+
+
+
+
 COMPILING
 ----------------------------------------------------------------------
 This program has been developed and tested on a Linux Ubuntu system,
@@ -141,13 +162,5 @@ a new connection for the subsequent session)
 ```
 
 
-
-
-## Requirements : 
-
-##### io_uring : 
-```shell
-sudo apt-get install liburing-dev
-```
 
 
