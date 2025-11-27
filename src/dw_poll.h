@@ -5,6 +5,11 @@
 #include <sys/epoll.h>
 #include <poll.h>
 
+#ifdef USE_IO_URING
+#include <liburing.h>
+#endif
+
+
 typedef enum { DW_SELECT, DW_POLL, DW_EPOLL, DW_IO_URING } dw_poll_type_t;  // io_uring TODO changed
 
 // these flags are OR-ed both in input and output to dw_poll_*()

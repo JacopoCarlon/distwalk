@@ -1353,9 +1353,10 @@ enum argp_node_option_keys {
     SSL_CIPHERS,
     SSL_CA_PATH,
     SSL_VERIFY,
-    USE_IO_URING    
+    USE_IO_URING
 };
 // io_uring TODO changed
+// todo : update USE_IO_URING to USE_IO_URING_OPT since USE_IO_URING is already a macro from compiler flag !
 
 struct argp_node_arguments {
     int periodic_sync_msec;
@@ -1625,7 +1626,7 @@ int main(int argc, char *argv[]) {
     #ifdef USE_IO_URING
         // io_uring TODO changed
         // Check if io_uring is available at runtime
-        struct io_ring ring;
+        struct io_uring ring;
         if (io_uring_queue_init(8, &ring, 0) < 0) {
             fprintf(stderr, "Warning: io_uring not available, falling back to epoll\n");
             poll_mode = DW_EPOLL;
@@ -1645,7 +1646,7 @@ int main(int argc, char *argv[]) {
     // Validate io_uring selection
     // io_uring TODO changed
     #ifndef USE_IO_URING
-        if (poll_mode == DW_IO_URING) {
+        if (poll_mode == DW_IO_URING && state) {
             argp_failure(state, 1, 0, "io_uring support not compiled in. Recompile with -DUSE_IO_URING");
         }
     #endif
@@ -1834,7 +1835,7 @@ int main(int argc, char *argv[]) {
 
     // Log polling mode
     // io_uring TODO changed
-    const char* poll_mode_str[] = {"select", "poll", "epoll", "io_uring"};
+    static const char* poll_mode_str[] = {"select", "poll", "epoll", "io_uring"};
     dw_log("Using polling mode: %s\n", poll_mode_str[poll_mode]);
 
     // Initialize conn_worker_infos

@@ -3,11 +3,23 @@ SHELL=/bin/bash
 MAKEFILE_DIR := $(dir $(firstword $(MAKEFILE_LIST)))
 TOPDIR       := $(abspath $(MAKEFILE_DIR)/..)
 
+# io_uring support
+USE_IO_URING ?= 1
+
+
 CFLAGS=-Wall -O3
 CFLAGS_DEBUG=-g -DDW_DEBUG -Wall -fprofile-arcs -ftest-coverage -fprofile-update=atomic
 CFLAGS_TSAN=-g -Wall -O2 -fsanitize=thread
 LDLIBS=-pthread -lm -lssl -lcrypto
 LDLIBS_DEBUG=-pthread -lm -lssl -lcrypto -lgcov
+
+ifeq ($(USE_IO_URING),1)
+CFLAGS += -DUSE_IO_URING
+CFLAGS_DEBUG += -DUSE_IO_URING
+CFLAGS_TSAN += -DUSE_IO_URING
+LDLIBS += -luring
+LDLIBS_DEBUG += -luring
+endif
 
 TEST_PROGRAMS=test_distrib test_distrib_debug test_ccmd test_ccmd_debug test_message test_message_debug test_pqueue test_pqueue_debug
 TEST_PROGRAMS+=test_queue test_queue_debug test_timespec test_timespec_debug dw_proxy dw_proxy_debug
@@ -97,3 +109,5 @@ $(BUILD_DIR)/%_tsan.o: %.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TSAN) -o $@ $^ $(LDLIBS)
 
 -include $(patsubst %.c,$(BUILD_DIR)/%.d $(BUILD_DIR)/%_debug.d $(BUILD_DIR)/%_tsan.d,$(wildcard *.c))
+
+
