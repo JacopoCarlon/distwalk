@@ -338,21 +338,43 @@ message_t* conn_prepare_recv_message(conn_info_t *conn) {
 
     #ifdef USE_IO_URING
         // Check if we have async data from io_uring
+        // First, check if we can process messages directly from async buffer (zero-copy)
         if (conn->async_data && conn->async_data_size > 0) {
-            // Copy async data to connection buffer
-            size_t copy_size = (conn->async_data_size < conn->curr_recv_size) ? 
-                            conn->async_data_size : conn->curr_recv_size;
+            message_t *m_async = (message_t *)conn->async_data;
             
-            memcpy(conn->curr_recv_buf, conn->async_data, copy_size);
-            conn->curr_recv_buf += copy_size;
-            conn->curr_recv_size -= copy_size;
-            
-            // Clear async data
-            conn->async_data = NULL;
-            conn->async_data_size = 0;
-            dw_log("Copied %zu bytes from async buffer\n", copy_size);
+            // Check if we have a complete message in async buffer
+            if (conn->async_data_size >= sizeof(message_t) && 
+                conn->async_data_size >= m_async->req_size) {
+                
+                // We have a complete message in async buffer - process it directly (zero-copy)
+                conn->curr_proc_buf = conn->async_data;
+                message_t *m = (message_t *)conn->curr_proc_buf;
+                conn->curr_proc_buf += m->req_size;
+                
+                // Update async buffer pointers
+                conn->async_data += m->req_size;
+                conn->async_data_size -= m->req_size;
+                
+                // If async buffer is now empty, reset it
+                if (conn->async_data_size == 0) {
+                    conn->async_data = NULL;
+                }
+                
+                dw_log("Processed message directly from async buffer (zero-copy), size=%d\n", m->req_size);
+                return m;
+            } else if (conn->async_data_size > 0) {
+                // Incomplete message in async buffer - fall back to copying
+                size_t copy_size = (conn->async_data_size < conn->curr_recv_size) ? 
+                                conn->async_data_size : conn->curr_recv_size;
+                memcpy(conn->curr_recv_buf, conn->async_data, copy_size);
+                conn->curr_recv_buf += copy_size;
+                conn->curr_recv_size -= copy_size;
+                conn->async_data = NULL;
+                conn->async_data_size = 0;
+                dw_log("Copied %zu bytes from async buffer (incomplete message)\n", copy_size);
+            }
         }
-    #endif
+     #endif
 
     unsigned long msg_size = conn->curr_recv_buf - conn->curr_proc_buf;
     message_t *m = (message_t *)conn->curr_proc_buf;
@@ -512,21 +534,30 @@ int conn_recv(conn_info_t *conn) {
 
     #ifdef USE_IO_URING
         // For io_uring, check if we already have async data
-        if (conn->async_data && conn->async_data_size > 0) {
-            // Data is already available from async operation
-            size_t copy_size = (conn->async_data_size < conn->curr_recv_size) ? 
-                              conn->async_data_size : conn->curr_recv_size;
+        if (conn->async_data && conn->async_data_size > 0) {            
+            // Check if we can process directly without copying
+            message_t *m_async = (message_t *)conn->async_data;
+            if (conn->async_data_size >= sizeof(message_t) && 
+                conn->async_data_size >= m_async->req_size) {
+                // Complete message available - no need to copy, just signal success
+                dw_log("RECV (io_uring) complete message available in async buffer, size=%d\n", m_async->req_size);
+                return 1;
+            } else if (conn->async_data_size > 0) {
+                // Incomplete data - copy to connection buffer
+                size_t copy_size = (conn->async_data_size < conn->curr_recv_size) ? 
+                                  conn->async_data_size : conn->curr_recv_size;
 
-            memcpy(conn->curr_recv_buf, conn->async_data, copy_size);
-            conn->curr_recv_buf += copy_size;
-            conn->curr_recv_size -= copy_size;
+                memcpy(conn->curr_recv_buf, conn->async_data, copy_size);
+                conn->curr_recv_buf += copy_size;
+                conn->curr_recv_size -= copy_size;
 
-            // Clear async data
-            conn->async_data = NULL;
-            conn->async_data_size = 0;
+                // Clear async data
+                conn->async_data = NULL;
+                conn->async_data_size = 0;
 
-            dw_log("RECV (io_uring) processed %zu bytes from async buffer\n", copy_size);
+                dw_log("RECV (io_uring) copied %zu bytes from async buffer (incomplete)\n", copy_size);
             return 1;
+            }
         }
     #endif
 

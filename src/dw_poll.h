@@ -8,6 +8,7 @@
 #ifdef USE_IO_URING
 #include <liburing.h>
 #endif
+#include "connection.h"
 
 
 typedef enum { DW_SELECT, DW_POLL, DW_EPOLL, DW_IO_URING } dw_poll_type_t;  // io_uring TODO changed
@@ -19,6 +20,17 @@ typedef enum { DW_POLLIN=0x001, DW_POLLOUT=0x004, DW_POLLONESHOT=1u << 30, DW_PO
 #define MAX_POLL_EVENTS 16
 #define IO_URING_ENTRIES 4096       // io_uring TODO changed 
 #define IO_URING_BATCH_SIZE 32      // Batch size for async operations
+
+
+typedef struct io_uring_op_tracking {
+    int fd;
+    uint64_t aux;
+    dw_poll_flags flags;
+    enum { OP_READ, OP_WRITE, OP_ACCEPT, OP_POLL } op_type;
+    void *buffer;
+    size_t size;
+    int conn_id;
+} io_uring_op_tracking_t;
 
 typedef struct {
     dw_poll_type_t poll_type;
@@ -52,18 +64,8 @@ typedef struct {
             // io_uring TODO changed
             struct {
                 struct io_uring ring;
-                struct io_uring_cqe *cqes[IO_URING_BATCH_SIZE];       
-                      
-                // Async operation tracking
-                struct {
-                    int fd;
-                    uint64_t aux;
-                    dw_poll_flags flags;
-                    enum { OP_READ, OP_WRITE, OP_ACCEPT, OP_POLL } op_type;
-                    void *buffer;
-                    size_t size;
-                    int conn_id;
-                } op_tracking[IO_URING_ENTRIES];
+                struct io_uring_cqe *cqes[IO_URING_BATCH_SIZE];
+                io_uring_op_tracking_t op_tracking[IO_URING_ENTRIES];
                 int pending_accepts;
 
                 int n_outstanding;

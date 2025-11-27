@@ -1,5 +1,8 @@
 #include <sys/socket.h>
 
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 #include "dw_poll.h"
 #include "dw_debug.h"
 
@@ -162,6 +165,7 @@ int dw_poll_add(dw_poll_t *p_poll, int fd, dw_poll_flags flags, uint64_t aux) {
                 // Check if this is a listening socket by checking if it's in listen_socks
                 // This is a simplification - you'd need to track listening sockets properly
                 struct sockaddr_in client_addr;
+                memset(&client_addr, 0, sizeof(client_addr));
                 socklen_t client_len = sizeof(client_addr);
                 
                 struct io_uring_sqe *accept_sqe = io_uring_get_sqe(ring);
@@ -436,7 +440,7 @@ int dw_poll_next(dw_poll_t *p_poll, dw_poll_flags *flags, uint64_t *aux) {
                 unsigned idx = cqe->user_data & ~(1ULL << 63);
                 int is_accept = (cqe->user_data & (1ULL << 63)) != 0;
                 
-                struct io_uring_op_tracking *op = &p_poll->u.io_uring_fds.op_tracking[idx];
+                io_uring_op_tracking_t *op = &p_poll->u.io_uring_fds.op_tracking[idx];
 
                 *flags = 0;
                 
@@ -453,6 +457,7 @@ int dw_poll_next(dw_poll_t *p_poll, dw_poll_flags *flags, uint64_t *aux) {
                         // Create connection for the accepted socket
                         struct sockaddr_in client_addr;
                         socklen_t client_len = sizeof(client_addr);
+                        memset(&client_addr, 0, sizeof(client_addr));
                         if (getpeername(accepted_sock, (struct sockaddr*)&client_addr, &client_len) == 0) {
                             int new_conn_id = conn_alloc(accepted_sock, client_addr, TCP);
                             if (new_conn_id >= 0) {
