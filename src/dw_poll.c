@@ -8,6 +8,12 @@
 #include <liburing.h>
 #endif
 
+// Define BUF_SIZE if not already defined (should match connection.h)
+#ifndef BUF_SIZE
+#define BUF_SIZE 65536
+#endif
+
+
 extern int use_wait_spinning;
 
 // return value useful to return failure if we allocate memory here in the future
@@ -28,10 +34,14 @@ int dw_poll_init(dw_poll_t *p_poll, dw_poll_type_t type) {
     // io_uring TODO changed
         case DW_IO_URING:
             memset(&p_poll->u.io_uring_fds, 0, sizeof(p_poll->u.io_uring_fds));
-            int ret = io_uring_queue_init(IO_URING_ENTRIES, &p_poll->u.io_uring_fds.ring, 0);
+            int ret = io_uring_queue_init(IO_URING_ENTRIES, &p_poll->u.io_uring_fds.ring, IORING_SETUP_SQPOLL);
             if (ret < 0) {
                 errno = -ret;
                 return -1;
+            }
+            // Pre-allocate buffers for async reads
+            for (int i = 0; i < IO_URING_ENTRIES; i++) {
+                p_poll->u.io_uring_fds.op_tracking[i].buffer = malloc(BUF_SIZE);
             }
             break;
     #endif
@@ -139,20 +149,53 @@ int dw_poll_add(dw_poll_t *p_poll, int fd, dw_poll_flags flags, uint64_t aux) {
                 return -1;
             }
             
-            // Use the sqe index as our user_data to map back to aux
             unsigned idx = sqe - ring->sq.sqes;
-            p_poll->u.io_uring_fds.aux_map[idx] = aux;
-            p_poll->u.io_uring_fds.fd_map[idx] = fd;
-            p_poll->u.io_uring_fds.flags_map[idx] = flags;
             
-            unsigned poll_events = 0;
-            if (flags & DW_POLLIN) poll_events |= POLLIN;
-            if (flags & DW_POLLOUT) poll_events |= POLLOUT;
+            // Store operation context
+            p_poll->u.io_uring_fds.op_tracking[idx].fd = fd;
+            p_poll->u.io_uring_fds.op_tracking[idx].aux = aux;
+            p_poll->u.io_uring_fds.op_tracking[idx].flags = flags;
+            p_poll->u.io_uring_fds.op_tracking[idx].conn_id = -1;
             
-            io_uring_prep_poll_add(sqe, fd, poll_events);
-            sqe->user_data = idx;
+            // For listening sockets, use async accept
+            if (flags & DW_POLLIN && fd >= 0) {
+                // Check if this is a listening socket by checking if it's in listen_socks
+                // This is a simplification - you'd need to track listening sockets properly
+                struct sockaddr_in client_addr;
+                socklen_t client_len = sizeof(client_addr);
+                
+                struct io_uring_sqe *accept_sqe = io_uring_get_sqe(ring);
+                if (accept_sqe) {
+                    io_uring_prep_accept(accept_sqe, fd, (struct sockaddr*)&client_addr, 
+                                       &client_len, 0);
+                    accept_sqe->user_data = idx | (1ULL << 63); // Mark as accept operation
+                    p_poll->u.io_uring_fds.op_tracking[idx].op_type = OP_ACCEPT;
+                    p_poll->u.io_uring_fds.pending_accepts++;
+                }
+            } else {
+                // For regular sockets, submit async read
+                if (flags & DW_POLLIN) {
+                    io_uring_prep_read(sqe, fd, p_poll->u.io_uring_fds.op_tracking[idx].buffer, 
+                                     BUF_SIZE, 0);
+                    p_poll->u.io_uring_fds.op_tracking[idx].op_type = OP_READ;
+                    p_poll->u.io_uring_fds.op_tracking[idx].size = BUF_SIZE;
+                } else if (flags & DW_POLLOUT) {
+                    // For write readiness, we use poll as fallback
+                    unsigned poll_events = (flags & DW_POLLIN ? POLLIN : 0) | (flags & DW_POLLOUT ? POLLOUT : 0);
+                    io_uring_prep_poll_add(sqe, fd, poll_events);
+                    p_poll->u.io_uring_fds.op_tracking[idx].op_type = OP_POLL;
+                }
+                
+                sqe->user_data = idx;
+            }
             
             p_poll->u.io_uring_fds.n_outstanding++;
+
+            // Submit batch if we have enough operations
+            if (p_poll->u.io_uring_fds.n_outstanding >= IO_URING_BATCH_SIZE) {
+                io_uring_submit(ring);
+            }
+
             rv = 0;
             break; }
     #endif
@@ -162,6 +205,8 @@ int dw_poll_add(dw_poll_t *p_poll, int fd, dw_poll_flags flags, uint64_t aux) {
     }
     return rv;
 }
+
+
 
 /* This tolerates on purpose being called after a ONESHOT event, for which
  * poll and select will have deleted the fd in their user-space lists, whilst
@@ -217,43 +262,29 @@ int dw_poll_mod(dw_poll_t *p_poll, int fd, dw_poll_flags flags, uint64_t aux) {
         #ifdef USE_IO_URING
             // io_uring TODO changed
             case DW_IO_URING: {
-                // For io_uring, we need to find and remove existing entries for this fd
-                // This is a limitation of the current abstraction - io_uring doesn't have direct mod
                 struct io_uring *ring = &p_poll->u.io_uring_fds.ring;
 
                 // First, remove any existing entries for this fd
                 for (unsigned i = 0; i < IO_URING_ENTRIES; i++) {
-                    if (p_poll->u.io_uring_fds.fd_map[i] == fd) {
+                    if (p_poll->u.io_uring_fds.op_tracking[i].fd == fd) {
                         // Mark as removed
-                        p_poll->u.io_uring_fds.fd_map[i] = -1;
+                        p_poll->u.io_uring_fds.op_tracking[i].fd = -1;
                         p_poll->u.io_uring_fds.n_outstanding--;
                     }
                 }
 
                 // If new flags are non-zero, add a new entry
                 if (flags != 0) {
-                    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-                    if (!sqe) {
-                        dw_log("No available SQEs in io_uring for mod\n");
-                        return -1;
+                    // Use dw_poll_add to add the modified entry
+                    rv = dw_poll_add(p_poll, fd, flags, aux);
+                } else {
+                    // Just submit any pending changes
+                    if (p_poll->u.io_uring_fds.n_outstanding > 0) {
+                        int submitted = io_uring_submit(ring);
+                        if (submitted < 0)
+                            return -1;
                     }
-
-                    unsigned idx = sqe - ring->sq.sqes;
-                    p_poll->u.io_uring_fds.aux_map[idx] = aux;
-                    p_poll->u.io_uring_fds.fd_map[idx] = fd;
-                    p_poll->u.io_uring_fds.flags_map[idx] = flags;
-
-                    unsigned poll_events = (flags & DW_POLLIN ? POLLIN : 0) | (flags & DW_POLLOUT ? POLLOUT : 0);
-                    io_uring_prep_poll_add(sqe, fd, poll_events);
-                    sqe->user_data = idx;
-
-                    p_poll->u.io_uring_fds.n_outstanding++;
                 }
-
-                // Submit the changes
-                int submitted = io_uring_submit(ring);
-                if (submitted < 0)
-                    return -1;
                 break; }
         #endif
         
@@ -262,6 +293,8 @@ int dw_poll_mod(dw_poll_t *p_poll, int fd, dw_poll_flags flags, uint64_t aux) {
     }
     return rv;
 }
+
+
 
 // return the number of file descriptors expected to iterate with dw_poll_next(),
 // or -1 setting errno
@@ -309,11 +342,9 @@ int dw_poll_wait(dw_poll_t *p_poll) {
         case DW_IO_URING: {
             struct io_uring *ring = &p_poll->u.io_uring_fds.ring;
             
-            // Submit all prepared SQEs
-            int submitted = io_uring_submit(ring);
-            if (submitted < 0) {
-                rv = -1;
-                break;
+            // Submit any pending operations
+            if (p_poll->u.io_uring_fds.n_outstanding > 0) {
+                io_uring_submit(ring);
             }
             
             // Wait for completions - get multiple CQEs in batch
@@ -330,6 +361,8 @@ int dw_poll_wait(dw_poll_t *p_poll) {
     }
     return rv;
 }
+
+
 
 // returned fd is automatically removed from dw_poll if marked 1SHOT
 int dw_poll_next(dw_poll_t *p_poll, dw_poll_flags *flags, uint64_t *aux) {
@@ -399,25 +432,93 @@ int dw_poll_next(dw_poll_t *p_poll, dw_poll_flags *flags, uint64_t *aux) {
             while (p_poll->u.io_uring_fds.cqe_iter < p_poll->u.io_uring_fds.cqe_count) {
                 struct io_uring *ring = &p_poll->u.io_uring_fds.ring;
                 struct io_uring_cqe *cqe = p_poll->u.io_uring_fds.cqes[p_poll->u.io_uring_fds.cqe_iter];
-                unsigned idx = cqe->user_data;
+                
+                unsigned idx = cqe->user_data & ~(1ULL << 63);
+                int is_accept = (cqe->user_data & (1ULL << 63)) != 0;
+                
+                struct io_uring_op_tracking *op = &p_poll->u.io_uring_fds.op_tracking[idx];
 
-                // Skip if this entry was removed/modified
-                if (p_poll->u.io_uring_fds.fd_map[idx] == -1) {
-                    io_uring_cqe_seen(ring, cqe);
-                    p_poll->u.io_uring_fds.cqe_iter++;
-                    continue;
+                *flags = 0;
+                
+                if (is_accept) {
+                    // Handle async accept completion
+                    if (cqe->res >= 0) {
+                        int accepted_sock = cqe->res;
+                        *flags = DW_POLLIN;
+                        *aux = op->aux;
+
+                        // Store the accepted socket fd for the caller
+                         op->fd = accepted_sock;
+                        
+                        // Create connection for the accepted socket
+                        struct sockaddr_in client_addr;
+                        socklen_t client_len = sizeof(client_addr);
+                        if (getpeername(accepted_sock, (struct sockaddr*)&client_addr, &client_len) == 0) {
+                            int new_conn_id = conn_alloc(accepted_sock, client_addr, TCP);
+                            if (new_conn_id >= 0) {
+                                conn_set_status_by_id(new_conn_id, READY);
+                                op->conn_id = new_conn_id;
+                                dw_log("Accepted connection: sock=%d -> conn_id=%d\n", accepted_sock, new_conn_id);
+                            }
+                        } else {
+                            dw_log("getpeername() failed for accepted socket %d\n", accepted_sock);
+                        }
+
+                        p_poll->u.io_uring_fds.pending_accepts--;
+                        
+                        // Immediately submit a read for the new connection
+                        struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+                        if (sqe) {
+                            unsigned new_idx = sqe - ring->sq.sqes;
+                            p_poll->u.io_uring_fds.op_tracking[new_idx].fd = accepted_sock;
+                            p_poll->u.io_uring_fds.op_tracking[new_idx].aux = op->aux;
+                            p_poll->u.io_uring_fds.op_tracking[new_idx].flags = DW_POLLIN;
+                            p_poll->u.io_uring_fds.op_tracking[new_idx].op_type = OP_READ;
+                            
+                            io_uring_prep_read(sqe, accepted_sock, 
+                                             p_poll->u.io_uring_fds.op_tracking[new_idx].buffer,
+                                             BUF_SIZE, 0);
+                            sqe->user_data = new_idx;
+                            p_poll->u.io_uring_fds.n_outstanding++;
+                        }
+                    }
+                } else if (op->op_type == OP_READ) {
+                    // Handle async read completion
+                    if (cqe->res > 0) {
+                        *flags = DW_POLLIN;
+                        *aux = op->aux;
+
+                        // Pass the async data to the connection layer
+                        int conn_id = op->conn_id;
+                        if (conn_id >= 0 && conn_id < MAX_CONNS) {
+                            conn_info_t *conn = conn_get_by_id(conn_id);
+                            if (conn) {
+                                conn->async_data = op->buffer;
+                                conn->async_data_size = cqe->res;
+                                dw_log("Set async data for conn_id=%d, size=%d\n", conn_id, cqe->res);
+                            }
+                        }
+
+                        // The data is available in op->buffer with size cqe->res
+                        // You'd need to pass this to the connection layer
+                    } else if (cqe->res < 0) {
+                        *flags = DW_POLLERR;
+                    }
+                } else if (op->op_type == OP_POLL) {
+                    // Handle poll completion (fallback)
+                    *flags |= (cqe->res & POLLIN) ? DW_POLLIN : 0;
+                    *flags |= (cqe->res & POLLOUT) ? DW_POLLOUT : 0;
+                    *flags |= (cqe->res < 0) ? DW_POLLERR : 0;
+                    *aux = op->aux;
                 }
 
-                *aux = p_poll->u.io_uring_fds.aux_map[idx];
-                *flags = 0;
-                *flags |= (cqe->res & POLLIN) ? DW_POLLIN : 0;
-                *flags |= (cqe->res & POLLOUT) ? DW_POLLOUT : 0;
-                *flags |= (cqe->res < 0) ? DW_POLLERR : 0;
 
                 io_uring_cqe_seen(ring, cqe);
                 p_poll->u.io_uring_fds.n_outstanding--;
                 p_poll->u.io_uring_fds.cqe_iter++;
-                return 1;
+                
+                if (*flags != 0) return 1;
+                continue; // Skip to next CQE if no events
             }
             break; }
     #endif

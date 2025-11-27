@@ -39,6 +39,12 @@ typedef struct {
     unsigned char *curr_send_buf; // curr ptr in send buffer while SENDING
     unsigned long curr_send_size; // size of leftover data to send
 
+    #ifdef USE_IO_URING
+        // For io_uring async operations
+        unsigned char *async_data;     // Pointer to async data from poll layer
+        size_t async_data_size;        // Size of async data available
+    #endif
+
     req_info_t *req_list;        // request ring buffer
     unsigned int serialize_request;
     pthread_t parent_thread;

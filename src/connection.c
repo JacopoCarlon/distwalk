@@ -58,6 +58,10 @@ void conn_init() {
         conns[i].ssl_handshake_done = 0;
         conns[i].ssl_is_server = 0;
         pthread_mutex_init(&conns[i].ssl_mtx, NULL);
+        #ifdef USE_IO_URING
+            conns[i].async_data = NULL;
+            conns[i].async_data_size = 0;
+        #endif
     }
 }
 
@@ -253,6 +257,10 @@ void conn_free(int conn_id) {
     // reset handshake state for this connection
     conns[conn_id].ssl_handshake_done = 0;
     conns[conn_id].ssl_is_server = 0;
+    #ifdef USE_IO_URING
+        conns[conn_id].async_data = NULL;
+        conns[conn_id].async_data_size = 0;
+    #endif
 }
 
 int conn_alloc(int conn_sock, struct sockaddr_in target, proto_t proto) {
@@ -297,6 +305,11 @@ int conn_alloc(int conn_sock, struct sockaddr_in target, proto_t proto) {
     ((message_t*) conns[conn_id].send_buf)->cmds[0].cmd = EOM;
     ((message_t*) conns[conn_id].recv_buf)->cmds[0].cmd = EOM;
 
+    #ifdef USE_IO_URING
+    conns[conn_id].async_data = NULL;
+    conns[conn_id].async_data_size = 0;
+    #endif
+
     return conn_id;
 
  continue_free:
@@ -322,6 +335,25 @@ message_t* conn_prepare_send_message(conn_info_t *conn) {
 
 message_t* conn_prepare_recv_message(conn_info_t *conn) {
     dw_log("Check whether we have new or leftover messages to process...\n");
+
+    #ifdef USE_IO_URING
+        // Check if we have async data from io_uring
+        if (conn->async_data && conn->async_data_size > 0) {
+            // Copy async data to connection buffer
+            size_t copy_size = (conn->async_data_size < conn->curr_recv_size) ? 
+                            conn->async_data_size : conn->curr_recv_size;
+            
+            memcpy(conn->curr_recv_buf, conn->async_data, copy_size);
+            conn->curr_recv_buf += copy_size;
+            conn->curr_recv_size -= copy_size;
+            
+            // Clear async data
+            conn->async_data = NULL;
+            conn->async_data_size = 0;
+            dw_log("Copied %zu bytes from async buffer\n", copy_size);
+        }
+    #endif
+
     unsigned long msg_size = conn->curr_recv_buf - conn->curr_proc_buf;
     message_t *m = (message_t *)conn->curr_proc_buf;
 
@@ -477,6 +509,27 @@ int conn_recv(conn_info_t *conn) {
 
     if (conn->use_ssl)
         return conn_ssl_recv(conn);
+
+    #ifdef USE_IO_URING
+        // For io_uring, check if we already have async data
+        if (conn->async_data && conn->async_data_size > 0) {
+            // Data is already available from async operation
+            size_t copy_size = (conn->async_data_size < conn->curr_recv_size) ? 
+                              conn->async_data_size : conn->curr_recv_size;
+
+            memcpy(conn->curr_recv_buf, conn->async_data, copy_size);
+            conn->curr_recv_buf += copy_size;
+            conn->curr_recv_size -= copy_size;
+
+            // Clear async data
+            conn->async_data = NULL;
+            conn->async_data_size = 0;
+
+            dw_log("RECV (io_uring) processed %zu bytes from async buffer\n", copy_size);
+            return 1;
+        }
+    #endif
+
 
     ssize_t received = recvfrom(sock, conn->curr_recv_buf, conn->curr_recv_size, 0,
                                (struct sockaddr*)&conn->target, (socklen_t*)&recvsize);
