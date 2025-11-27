@@ -1,1 +1,18 @@
-*.d
+*.o 
+*.d 
+*.gcno 
+*.gcda 
+*.gcov 
+*~ 
+*.bak 
+log_tests.txt 
+
+## perhaps too specific : 
+##  *.log
+##  *_debug
+##  *_message
+##  *_pqueue
+##  *_queue
+##  *_timespec
+##  *_proxy
+
